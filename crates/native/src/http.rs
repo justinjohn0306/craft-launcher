@@ -298,9 +298,10 @@ impl Http {
         let (start, total) = match status {
             200 => (0, header("content-length").and_then(|v| v.parse::<u64>().ok()).filter(|n| *n > 0).unwrap_or(size)),
             206 => match header("content-range").as_deref().and_then(parse_content_range) {
-                Some((start, Some(total))) => (start, total),
-                Some((start, None)) => (start, size),
+                Some((start, end, Some(total))) if start == have && end < total => (start, total),
+                Some((start, end, None)) if start == have && size > end => (start, size),
                 None => return Err(retry("the server sent an unreadable partial response".into(), false)),
+                _ => return Err(retry("the server sent a partial response for the wrong byte range".into(), false)),
             },
             // The range is past the end: the part file is already complete (or wrong; the
             // checksum decides).
@@ -500,12 +501,17 @@ fn part_path(dest: &Path, size: u64) -> std::path::PathBuf {
 }
 
 /// `bytes 100-199/1000` → (100, Some(1000)); `bytes 100-199/*` → (100, None).
-fn parse_content_range(v: &str) -> Option<(u64, Option<u64>)> {
+fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
     let rest = v.trim().strip_prefix("bytes ")?;
     let (range, total) = rest.split_once('/')?;
-    let start = range.split_once('-')?.0.trim().parse().ok()?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.trim().parse().ok()?;
+    let end = end.trim().parse().ok()?;
+    if end < start {
+        return None;
+    }
     let total = if total.trim() == "*" { None } else { Some(total.trim().parse().ok()?) };
-    Some((start, total))
+    Some((start, end, total))
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -643,10 +649,11 @@ pub(crate) mod tests {
 
     #[test]
     fn reads_content_ranges() {
-        assert_eq!(parse_content_range("bytes 100-199/1000"), Some((100, Some(1000))));
-        assert_eq!(parse_content_range("bytes 5-9/*"), Some((5, None)));
+        assert_eq!(parse_content_range("bytes 100-199/1000"), Some((100, 199, Some(1000))));
+        assert_eq!(parse_content_range("bytes 5-9/*"), Some((5, 9, None)));
         assert_eq!(parse_content_range("items 1-2/3"), None);
         assert_eq!(parse_content_range("bytes x-9/10"), None);
+        assert_eq!(parse_content_range("bytes 10-9/20"), None);
     }
 
     use std::io::{BufRead, BufReader};
