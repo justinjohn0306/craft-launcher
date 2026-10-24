@@ -335,7 +335,7 @@ pub(crate) fn choose_kinds_with(
 /// Whether this system has a working pacman installation and pacman database.
 fn can_pacman() -> bool {
     #[cfg(target_os = "linux")]
-    return which("pacman").is_some() && crate::detect::linux::has_pacman_db();
+    return find_in(&SYSTEM_BIN_DIRS, std::ffi::OsStr::new("pacman")).is_some() && crate::detect::linux::has_pacman_db();
     #[cfg(not(target_os = "linux"))]
     return false;
 }
@@ -677,11 +677,47 @@ fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
+/// The root-owned directories that programs run as root come from. `pkexec` looks a bare program
+/// name up on the caller's `PATH`, so it is always handed an absolute path from one of these.
+#[cfg(target_os = "linux")]
+const SYSTEM_BIN_DIRS: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+/// FreeBSD's packages, polkit's `pkexec` among them, install under `/usr/local`.
+#[cfg(target_os = "freebsd")]
+const SYSTEM_BIN_DIRS: [&str; 6] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin", "/usr/local/sbin"];
+
+/// `name` in the first of `dirs` that has it.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn find_in(dirs: &[impl AsRef<Path>], name: &std::ffi::OsStr) -> Option<PathBuf> {
+    dirs.iter().map(|d| d.as_ref().join(name)).find(|p| p.is_file())
+}
+
+/// `args` with its program as an absolute path: a bare name is looked up in `dirs`.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn with_absolute_program(dirs: &[impl AsRef<Path>], args: &[&std::ffi::OsStr]) -> Result<Vec<std::ffi::OsString>, String> {
+    let (program, rest) = args.split_first().ok_or("there is no command to run")?;
+    let path = Path::new(program);
+    let program = if path.is_absolute() {
+        path.to_path_buf()
+    } else if path.file_name() == Some(*program) {
+        find_in(dirs, program).ok_or_else(|| format!("{} isn't installed", path.display()))?
+    } else {
+        return Err(format!("{} isn't a program name", path.display()));
+    };
+    Ok(std::iter::once(program.into_os_string()).chain(rest.iter().map(|a| a.to_os_string())).collect())
+}
+
+/// polkit's `pkexec`, from the same directories as the programs it runs.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn pkexec() -> Option<PathBuf> {
+    find_in(&SYSTEM_BIN_DIRS, std::ffi::OsStr::new("pkexec"))
+}
+
 /// Runs a command as root through polkit (`pkexec`), which shows the desktop's password prompt.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn run_as_root(args: &[&std::ffi::OsStr]) -> Result<(), String> {
-    let pkexec = which("pkexec").ok_or("installing system-wide needs polkit (pkexec), which isn't installed")?;
-    let status = process::command(pkexec).args(args).status().map_err(|e| format!("couldn't ask for permission ({e})"))?;
+    let args = with_absolute_program(&SYSTEM_BIN_DIRS, args)?;
+    let pkexec = pkexec().ok_or("installing system-wide needs polkit (pkexec), which isn't installed")?;
+    let status = process::command(pkexec).args(&args).status().map_err(|e| format!("couldn't ask for permission ({e})"))?;
     root_outcome(status.code())
 }
 
@@ -731,11 +767,19 @@ pub(crate) mod linux {
     use artcraft_launcher_core::distro;
     use artcraft_launcher_core::protocol::CANCELLED;
 
-    use super::*;
+    use super::{
+        CraftApp, INSTALLER, InstallSource, Installed, JobPhase, PackageKind, Path, PathBuf, Paths, Record, SHARED_CALL, SYSTEM_BIN_DIRS, Stop,
+        cancelled, find_in, pkexec, process, run_as_root, swap_into_place, tree, turn,
+    };
 
     /// apt waits this long for another package tool (a software centre, automatic updates) to
     /// let go of its lock, instead of failing at once.
     const APT_WAITS: &str = "DPkg::Lock::Timeout=60";
+
+    /// A package tool that root commands can run, from the same directories `run_as_root` uses.
+    fn system_tool(name: &str) -> Option<PathBuf> {
+        find_in(&SYSTEM_BIN_DIRS, OsStr::new(name))
+    }
 
     /// Where commands that need root go: the installer's queue, then `pkexec`.
     pub struct Root<'a> {
@@ -776,8 +820,8 @@ pub(crate) mod linux {
         match kind {
             // apt resolves dependencies and records the package like any other.
             PackageKind::Deb => Some(&["apt-get", "-o", APT_WAITS, "install", "-y", "--allow-downgrades"]),
-            PackageKind::Rpm if which("dnf").is_some() => Some(&["dnf", "install", "-y"]),
-            PackageKind::Rpm if which("zypper").is_some() => Some(&["zypper", "--non-interactive", "install", "--allow-unsigned-rpm"]),
+            PackageKind::Rpm if system_tool("dnf").is_some() => Some(&["dnf", "install", "-y"]),
+            PackageKind::Rpm if system_tool("zypper").is_some() => Some(&["zypper", "--non-interactive", "install", "--allow-unsigned-rpm"]),
             PackageKind::Rpm => Some(&["rpm", "-U", "--replacepkgs"]),
             PackageKind::ArchPkg => Some(&["pacman", "-U", "--noconfirm"]),
             _ => None,
@@ -806,14 +850,14 @@ pub(crate) mod linux {
         let flatpak = process::is_flatpak_available();
         let is_flatpak = process::in_sandbox();
         let is_appimage = std::env::var_os("APPIMAGE").is_some();
-        let root = which("pkexec").is_some();
+        let root = pkexec().is_some();
         let os = ["/etc/os-release", "/usr/lib/os-release"].iter().find_map(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
         let native = distro::native_package(&distro::parse_os_release(&os));
         // An ostree system can't take .deb or .rpm installs, whatever os-release says.
         let root = root && !immutable_ostree();
-        let can_deb = root && native == Some(PackageKind::Deb) && which("apt-get").is_some() && which("dpkg").is_some();
-        let can_rpm = root && native == Some(PackageKind::Rpm) && which("rpm").is_some();
-        let can_arch = root && native == Some(PackageKind::ArchPkg) && which("pacman").is_some() && crate::detect::linux::has_pacman_db();
+        let can_deb = root && native == Some(PackageKind::Deb) && system_tool("apt-get").is_some() && system_tool("dpkg").is_some();
+        let can_rpm = root && native == Some(PackageKind::Rpm) && system_tool("rpm").is_some();
+        let can_arch = root && native == Some(PackageKind::ArchPkg) && system_tool("pacman").is_some() && crate::detect::linux::has_pacman_db();
         order_available_kinds(is_flatpak, is_appimage, flatpak, can_deb, can_rpm, can_arch)
     }
 
@@ -859,10 +903,10 @@ pub(crate) mod linux {
 
     /// Installs (or upgrades) a downloaded package with the system's own tools.
     pub fn install_package(kind: PackageKind, file: &Path, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
-        if kind == PackageKind::Deb && which("apt-get").is_none() {
+        if kind == PackageKind::Deb && system_tool("apt-get").is_none() {
             return Err("this system has no apt-get to install a Debian package with".into());
         }
-        if kind == PackageKind::ArchPkg && which("pacman").is_none() {
+        if kind == PackageKind::ArchPkg && system_tool("pacman").is_none() {
             return Err("this system has no pacman to install an Arch package with".into());
         }
         install_package_via(&SYSTEM, kind, file, stop, phase)
@@ -906,10 +950,10 @@ pub(crate) mod linux {
     pub fn remove_package(app: &CraftApp, installed: &Installed, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
         let mut remove = |command: &[&str], package: &str| as_root(&SYSTEM, command, OsStr::new(package), stop, phase, JobPhase::Removing);
         match installed.source {
-            InstallSource::Deb if which("apt-get").is_some() => remove(&["apt-get", "-o", APT_WAITS, "remove", "-y"], app.id),
+            InstallSource::Deb if system_tool("apt-get").is_some() => remove(&["apt-get", "-o", APT_WAITS, "remove", "-y"], app.id),
             InstallSource::Deb => remove(&["dpkg", "-r"], app.id),
             InstallSource::Rpm => {
-                if which("dnf").is_some() {
+                if system_tool("dnf").is_some() {
                     remove(&["dnf", "remove", "-y"], app.id)
                 } else {
                     remove(&["rpm", "-e"], app.id)
@@ -959,7 +1003,9 @@ pub(crate) mod linux {
         let staging = super::staging_dir(&dir)?;
         let partial = staging.path().join(name);
         std::fs::copy(file, &partial).map_err(|e| format!("couldn't copy the AppImage ({e})"))?;
-        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+        // The AppImage is the program the user just installed and must be executable; 0o755 is
+        // not group/world-writable.
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?; // NOSONAR
         std::fs::rename(&partial, &dest).map_err(|e| format!("couldn't put the AppImage in place ({e})"))?;
         let mut removed = Vec::new();
         if let Some(old) = previous.filter(|r| r.kind == PackageKind::AppImage && r.path != dest)
@@ -1022,7 +1068,9 @@ pub(crate) mod linux {
         if !here.metadata().map_err(|e| e.to_string())?.file_type().is_file() {
             return Err("the download's app binary isn't a regular file".into());
         }
-        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).map_err(|e| format!("couldn't make {} runnable ({e})", bin.display()))
+        // Verified non-symlink regular file inside the launcher's apps folder; the app binary must
+        // be executable and 0o755 is not group/world-writable.
+        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).map_err(|e| format!("couldn't make {} runnable ({e})", bin.display())) // NOSONAR
     }
 
     /// Removes a tree the launcher unpacked in [`install_tree`], keeping the app's `home/`: the
@@ -1168,7 +1216,7 @@ pub mod macos {
 
     use artcraft_launcher_core::version::Version;
 
-    use super::*;
+    use super::{CraftApp, InstallSource, Installed, Path, PathBuf, Paths, Release, process, staging_dir, swap_into_place};
 
     /// `/Applications` when we can write there, else `~/Applications`.
     fn applications_dir(existing: Option<&Installed>, destination: Option<&Path>) -> Result<PathBuf, String> {
@@ -1370,7 +1418,7 @@ pub mod macos {
 #[cfg(unix)]
 #[allow(dead_code)]
 mod tree {
-    use super::*;
+    use super::{CraftApp, Path, PathBuf, single_top_folder};
 
     /// Unpacks `file` and returns a staging folder laid out like `/usr/local`.
     pub fn unpack(app: &CraftApp, file: &Path, staging: &Path) -> Result<PathBuf, String> {
@@ -1430,7 +1478,7 @@ mod tree {
 mod freebsd {
     use std::ffi::OsStr;
 
-    use super::*;
+    use super::{CraftApp, Path, PathBuf, Paths, pkexec, process, run_as_root, tree};
 
     /// Copies the release's tree into `/usr/local` (asking for permission through polkit), or
     /// into `~/.local` when polkit isn't installed. Returns the binary, every file installed,
@@ -1447,7 +1495,7 @@ mod freebsd {
         let rel = tree::files(&tree);
         let mut source = tree.into_os_string();
         source.push("/.");
-        if which("pkexec").is_some() {
+        if pkexec().is_some() {
             let prefix = PathBuf::from("/usr/local");
             run_as_root(&[OsStr::new("/bin/cp"), OsStr::new("-R"), &source, prefix.as_os_str()])?;
             return Ok((prefix.join("bin").join(app.id), rel.iter().map(|r| prefix.join(r)).collect(), true));
@@ -1529,7 +1577,7 @@ pub(crate) fn msi_path(msi: &Path) -> Result<PathBuf, String> {
 pub mod windows {
     use artcraft_launcher_core::protocol::CANCELLED;
 
-    use super::*;
+    use super::{CraftApp, INSTALLER, JobPhase, Path, PathBuf, Stop, cancelled, msi_command, msi_folder_argument, msi_log, process, turn};
 
     fn msiexec() -> PathBuf {
         std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from).join(r"System32\msiexec.exe")
@@ -2102,6 +2150,35 @@ mod tests {
         for wanted in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"] {
             assert!(env.iter().any(|(name, _)| *name == wanted), "{wanted} isn't set");
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn root_commands_run_programs_by_absolute_path_from_the_given_dirs() {
+        use std::ffi::OsStr;
+        let root = tempfile::tempdir().unwrap();
+        let (usr_bin, sbin) = (root.path().join("usr/bin"), root.path().join("sbin"));
+        std::fs::create_dir_all(&usr_bin).unwrap();
+        std::fs::create_dir_all(&sbin).unwrap();
+        std::fs::write(usr_bin.join("rpm"), b"").unwrap();
+        std::fs::write(sbin.join("rpm"), b"").unwrap();
+        std::fs::write(sbin.join("zypper"), b"").unwrap();
+        let dirs = [&usr_bin, &sbin];
+        let run = |args: &[&str]| {
+            let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+            with_absolute_program(&dirs, &args).map(|a| a.into_iter().map(PathBuf::from).collect::<Vec<_>>())
+        };
+
+        // The first directory that has the program wins, and the arguments follow unchanged.
+        assert_eq!(run(&["rpm", "-e", "wordcraft"]), Ok(vec![usr_bin.join("rpm"), "-e".into(), "wordcraft".into()]));
+        assert_eq!(run(&["zypper"]), Ok(vec![sbin.join("zypper")]));
+        // A program that isn't in those directories isn't looked for anywhere else.
+        assert_eq!(run(&["dnf", "remove"]), Err("dnf isn't installed".into()));
+        // An absolute path is kept; a relative path with folders in it is refused.
+        assert_eq!(run(&["/bin/cp", "-R"]), Ok(vec!["/bin/cp".into(), "-R".into()]));
+        assert!(run(&["../usr/bin/rpm"]).is_err());
+        assert!(run(&["bin/rpm"]).is_err());
+        assert!(run(&[]).is_err());
     }
 
     #[cfg(target_os = "linux")]
